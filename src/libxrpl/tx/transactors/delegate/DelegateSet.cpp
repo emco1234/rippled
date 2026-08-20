@@ -1,17 +1,13 @@
 #include <xrpl/tx/transactors/delegate/DelegateSet.h>
 
 #include <xrpl/basics/Log.h>
-#include <xrpl/basics/safe_cast.h>
 #include <xrpl/beast/utility/Journal.h>
-#include <xrpl/beast/utility/Zero.h>
 #include <xrpl/core/ServiceRegistry.h>
-#include <xrpl/ledger/ReadView.h>
 #include <xrpl/ledger/helpers/AccountRootHelpers.h>
 #include <xrpl/ledger/helpers/DirectoryHelpers.h>
 #include <xrpl/ledger/helpers/SponsorHelpers.h>
 #include <xrpl/protocol/Feature.h>
 #include <xrpl/protocol/Indexes.h>
-#include <xrpl/protocol/LedgerFormats.h>
 #include <xrpl/protocol/Protocol.h>
 #include <xrpl/protocol/SField.h>
 #include <xrpl/protocol/STLedgerEntry.h>
@@ -25,47 +21,6 @@
 #include <unordered_set>
 
 namespace xrpl {
-
-namespace {
-
-// Count Delegate objects linked into authorize's owner directory (inbound).
-// Stops at kMaxDeletableDirEntries so the walk stays bounded.
-std::uint32_t
-countInboundDelegates(ReadView const& view, AccountID const& authorize)
-{
-    Keylet const ownerDirKeylet{keylet::ownerDir(authorize)};
-    if (dirIsEmpty(view, ownerDirKeylet))
-        return 0;
-
-    SLE::const_pointer sleDirNode{};
-    unsigned int uDirEntry{0};
-    uint256 dirEntry{beast::kZero};
-
-    if (!cdirFirst(view, ownerDirKeylet.key, sleDirNode, uDirEntry, dirEntry))
-        return 0;
-
-    std::uint32_t inbound{0};
-    do
-    {
-        auto const sleItem = view.read(keylet::child(dirEntry));
-        if (!sleItem)
-            continue;
-
-        auto const nodeType = safeCast<LedgerEntryType>((*sleItem)[sfLedgerEntryType]);
-        if (nodeType != ltDELEGATE)
-            continue;
-        if ((*sleItem)[sfAuthorize] != authorize)
-            continue;
-
-        ++inbound;
-        if (inbound >= kMaxDeletableDirEntries)
-            return inbound;
-    } while (cdirNext(view, ownerDirKeylet.key, sleDirNode, uDirEntry, dirEntry));
-
-    return inbound;
-}
-
-}  // namespace
 
 NotTEC
 DelegateSet::preflight(PreflightContext const& ctx)
@@ -106,20 +61,17 @@ DelegateSet::preclaim(PreclaimContext const& ctx)
         return tecPSEUDO_ACCOUNT;
 
     // Deleting the delegate object is invalid if it doesn’t exist.
-    if (ctx.tx.getFieldArray(sfPermissions).empty() &&
-        !ctx.view.exists(keylet::delegate(ctx.tx[sfAccount], ctx.tx[sfAuthorize])))
+    // Outbound: Account is the delegator. Inbound refuse (fixDelegateAccountDelete):
+    // Account is the authorized account and Authorize is the original delegator.
+    // O(1) keylet lookup, no owner-directory walk. See issue 7691.
+    if (ctx.tx.getFieldArray(sfPermissions).empty())
     {
-        return tecNO_ENTRY;
-    }
-
-    // Cap inbound Delegates so AccountDelete of the authorized account cannot
-    // be forced to walk an unbounded owner directory. See issue 7691.
-    bool const creating = !ctx.tx.getFieldArray(sfPermissions).empty() &&
-        !ctx.view.exists(keylet::delegate(ctx.tx[sfAccount], ctx.tx[sfAuthorize]));
-    if (creating && ctx.view.rules().enabled(fixDelegateAccountDelete) &&
-        countInboundDelegates(ctx.view, ctx.tx[sfAuthorize]) >= kMaxDeletableDirEntries)
-    {
-        return tecDIR_FULL;
+        bool const outbound =
+            ctx.view.exists(keylet::delegate(ctx.tx[sfAccount], ctx.tx[sfAuthorize]));
+        bool const inboundRefuse = ctx.view.rules().enabled(fixDelegateAccountDelete) &&
+            ctx.view.exists(keylet::delegate(ctx.tx[sfAuthorize], ctx.tx[sfAccount]));
+        if (!outbound && !inboundRefuse)
+            return tecNO_ENTRY;
     }
 
     return tesSUCCESS;
@@ -152,7 +104,16 @@ DelegateSet::doApply()
 
     auto const& permissions = ctx_.tx.getFieldArray(sfPermissions);
     if (permissions.empty())
+    {
+        // Authorized account refuses an inbound Delegate. Lookup is
+        // keylet::delegate(delegator, dest) = delegate(Authorize, Account).
+        if (ctx_.view().rules().enabled(fixDelegateAccountDelete))
+        {
+            if (auto inbound = ctx_.view().peek(keylet::delegate(authAccount, accountID_)))
+                return deleteDelegate(view(), inbound, j_);
+        }
         return tecINTERNAL;  // LCOV_EXCL_LINE
+    }
 
     if (auto const ret = checkReserve(
             ctx_.getApplyViewContext(),
